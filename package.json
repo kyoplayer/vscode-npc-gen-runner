@@ -2,7 +2,7 @@
   "name": "vscode-npc-gen-runner",
   "displayName": "NPC Gen Runner",
   "description": "Fetch generator from contest pages and run user solutions with generated seeds.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "publisher": "kyoplayer",
   "engines": {
     "vscode": "^1.60.0"
@@ -66,10 +66,20 @@
           "default": "main.py",
           "description": "Main solution filename."
         },
-        "npc.timeoutMs": {
+        "npc.timeoutMsGen": {
           "type": "number",
           "default": 30000,
-          "description": "Timeout in milliseconds for running solutions."
+          "description": "Timeout in milliseconds for generator runs."
+        },
+        "npc.timeoutMsMain": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in milliseconds for main solution runs."
+        },
+        "npc.timeoutMsScorer": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in milliseconds for scorer runs."
         },
         "npc.maxOutputBytes": {
           "type": "number",

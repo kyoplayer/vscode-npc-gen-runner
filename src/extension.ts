@@ -31,7 +31,9 @@ function defaultCfg() {
     pythonPath: "py",
     genFilename: "gen.py",
     mainFilename: "main.py",
-    timeoutMs: 30000,
+    timeoutMsGen: 30000,
+    timeoutMsMain: 30000,
+    timeoutMsScorer: 30000,
     maxOutputBytes: 10 * 1000 * 1000,
     outputDir: ".",
     threads: 0,
@@ -249,6 +251,11 @@ function killProcGroup(p: ChildProcess | null) {
     }
     if (process.platform !== 'win32') {
       try { process.kill(-pid, 'SIGKILL'); } catch {}
+    } else {
+      // On Windows, ensure the whole process tree is terminated using taskkill
+      try {
+        try { execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' }); } catch {}
+      } catch {}
     }
     try { p.kill('SIGKILL'); } catch {}
   } catch (e) {}
@@ -322,7 +329,8 @@ async function fetchGeneratorAndSave(urlOrShort: string, genPath: string, output
 function makeWrapperContent(seed: string, sharedVars: string[] = [], sharedFilePath?: string): string {
   const sharedVarsJson = JSON.stringify(sharedVars || []);
   const sharedFilePathJson = sharedFilePath ? JSON.stringify(sharedFilePath) : "None";
-  const seedLiteral = JSON.stringify(seed); // 安全なリテラル化（数値なら数値っぽく、文字列なら "..."）
+  const seedNum = Number(seed);
+  const seedLiteral = Number.isFinite(seedNum) ? String(seedNum) : JSON.stringify(seed);
   return `
 import sys, io, traceback, re, json, os
 src = open('gen.py','r',encoding='utf-8').read()
@@ -406,6 +414,7 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
 
       let collected = Buffer.alloc(0);
       let stderrAll = "";
+      let timedOut = false;
       if (proc.stderr) proc.stderr.on("data", d => { stderrAll += d.toString(); });
       if (proc.stdout) {
         proc.stdout.on("data", (chunk: Buffer) => {
@@ -421,13 +430,14 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
       }
 
       const start = Date.now();
-      const timer = setTimeout(() => { try { killProcGroup(proc); } catch {} }, timeoutMs);
+      const timer = setTimeout(() => { try { timedOut = true; killProcGroup(proc); } catch {} }, timeoutMs);
 
       proc.on("close", (code, signal) => {
         clearTimeout(timer);
         const end = Date.now();
         const realMs = end - start;
         const outStr = collected.toString("utf8");
+        // prefer cpu time if available
         if (useTime) {
           try {
             const cpuText = fs.existsSync(cpuFile) ? fs.readFileSync(cpuFile, "utf8").trim() : "";
@@ -440,7 +450,12 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
                 try { fs.unlinkSync(cpuFile); } catch {}
                 const arr = runningProcesses.get(seedSafeForTracking) || [];
                 runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
-                resolve({ exitCode: code ?? 0, stdout: outStr, stderr: stderrAll, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? null });
+                if (timedOut) {
+                  const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
+                  resolve({ exitCode: null, stdout: outStr, stderr: stderrTimed, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? 'SIGKILL' });
+                } else {
+                  resolve({ exitCode: code === null ? null : code, stdout: outStr, stderr: stderrAll, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? null });
+                }
                 return;
               }
             }
@@ -450,7 +465,12 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
         }
         const arr = runningProcesses.get(seedSafeForTracking) || [];
         runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
-        resolve({ exitCode: code ?? 0, stdout: outStr, stderr: stderrAll, realTimeMs: realMs, exitSignal: signal ?? null });
+        if (timedOut) {
+          const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
+          resolve({ exitCode: null, stdout: outStr, stderr: stderrTimed, realTimeMs: realMs, exitSignal: signal ?? 'SIGKILL' });
+        } else {
+          resolve({ exitCode: code === null ? null : code, stdout: outStr, stderr: stderrAll, realTimeMs: realMs, exitSignal: signal ?? null });
+        }
       });
 
       proc.on("error", (err) => {
@@ -466,11 +486,7 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
     const psContent = `
 param([string] $cmd)
 # read stdin (if any)
-try {
-  $stdinData = [Console]::In.ReadToEnd()
-} catch {
-  $stdinData = ""
-}
+try { $stdinData = [Console]::In.ReadToEnd() } catch { $stdinData = "" }
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 function EmitResult($cpu, $real, $out, $err, $exit) {
@@ -478,85 +494,106 @@ function EmitResult($cpu, $real, $out, $err, $exit) {
   $res | ConvertTo-Json -Compress
 }
 
-# detect if command is simple (no pipes/redirs/etc)
-if ($cmd -match '[\\|&<>;*?^()|]') {
-  $useCmd = $true
-} else {
-  $useCmd = $false
+function SumProcessTreeCpu($rootPid) {
+  $sum = 0
+  try {
+    $all = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId
+    $stack = New-Object System.Collections.ArrayList
+    [void]$stack.Add([int]$rootPid)
+    $visited = @{}
+    $children = @()
+    while ($stack.Count -gt 0) {
+      $cur = $stack[0]
+      $stack.RemoveAt(0)
+      if ($visited.ContainsKey($cur)) { continue }
+      $visited[$cur] = $true
+      $children += $cur
+      $kids = $all | Where-Object { $_.ParentProcessId -eq $cur } | Select-Object -ExpandProperty ProcessId
+      foreach ($k in $kids) { [void]$stack.Add([int]$k) }
+    }
+    foreach ($pid in $children) {
+      try {
+        $gp = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        if ($gp) { $sum += $gp.TotalProcessorTime.TotalMilliseconds }
+      } catch {}
+    }
+  } catch {}
+  return [int][math]::Round($sum)
+}
+
+# naive tokenization to get executable and args
+$m = [regex] '"([^"]*)"|''([^'']*)''|([^\s]+)'
+$parts = @()
+foreach ($mm in $m.Matches($cmd)) {
+  if ($mm.Groups[1].Success) { $parts += $mm.Groups[1].Value }
+  elseif ($mm.Groups[2].Success) { $parts += $mm.Groups[2].Value }
+  else { $parts += $mm.Groups[3].Value }
 }
 
 try {
-  if (-not $useCmd) {
-    # naive tokenization: split respecting quoted tokens (double or single)
-    $m = [regex]'"([^"]*)"|''([^'']*)''|([^\\s]+)'
-    $parts = @()
-    foreach ($mm in $m.Matches($cmd)) {
-      if ($mm.Groups[1].Success) { $parts += $mm.Groups[1].Value }
-      elseif ($mm.Groups[2].Success) { $parts += $mm.Groups[2].Value }
-      else { $parts += $mm.Groups[3].Value }
-    }
-    if ($parts.Count -ge 1) {
-      $file = $parts[0]
-      $args = ""
-      if ($parts.Count -gt 1) {
-        $args = ($parts[1..($parts.Count-1)] | ForEach-Object { $_ }) -join ' '
-      }
-      $psi = New-Object System.Diagnostics.ProcessStartInfo
-      $psi.FileName = $file
-      $psi.Arguments = $args
-      $psi.RedirectStandardOutput = $true
-      $psi.RedirectStandardError  = $true
-      $psi.RedirectStandardInput = $true
-      $psi.UseShellExecute = $false
-      $psi.CreateNoWindow = $true
+  if ($parts.Count -ge 1) {
+    $exe = $parts[0]
+    $argList = @()
+    if ($parts.Count -gt 1) { $argList = $parts[1..($parts.Count-1)] }
+    $outFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "npc_out_$(New-Guid).txt")
+    $errFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "npc_err_$(New-Guid).txt")
 
-      $p = New-Object System.Diagnostics.Process
-      $p.StartInfo = $psi
-      $started = $p.Start()
-      if ($stdinData -ne $null -and $stdinData.Length -gt 0) {
-        try { $p.StandardInput.Write($stdinData) } catch {}
+    try {
+      $p = Start-Process -FilePath $exe -ArgumentList $argList -RedirectStandardOutput $outFile -RedirectStandardError $errFile -NoNewWindow -PassThru
+      $observed = 0
+      while (-not $p.HasExited) {
+        try { $val = SumProcessTreeCpu($p.Id); if ($val -gt $observed) { $observed = $val } } catch {}
+        Start-Sleep -Milliseconds 50
       }
-      try { $p.StandardInput.Close() } catch {}
-      $out = $p.StandardOutput.ReadToEnd()
-      $err = $p.StandardError.ReadToEnd()
-      $p.WaitForExit()
+      try { $val = SumProcessTreeCpu($p.Id); if ($val -gt $observed) { $observed = $val } } catch {}
       $sw.Stop()
       $realMs = [int]$sw.ElapsedMilliseconds
-      $cpuMainMs = 0
-      try { $cpuMainMs = [int]([math]::Round($p.TotalProcessorTime.TotalMilliseconds)) } catch {}
-      EmitResult $cpuMainMs $realMs $out $err $p.ExitCode
+      $out = ""
+      $err = ""
+      try { $out = Get-Content -Raw -LiteralPath $outFile -ErrorAction SilentlyContinue } catch {}
+      try { $err = Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue } catch {}
+      try { Remove-Item -LiteralPath $outFile -ErrorAction SilentlyContinue } catch {}
+      try { Remove-Item -LiteralPath $errFile -ErrorAction SilentlyContinue } catch {}
+      EmitResult $observed $realMs $out $err $p.ExitCode
       exit 0
-    } else {
-      # fallback
-      $useCmd = $true
-    }
-  }
+    } catch {
+      # fallback to cmd.exe invocation when Start-Process redirect not supported or fails
+      $e = $_.Exception.ToString()
+      # attempt cmd.exe /c
+      $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+      $psi2.FileName = "cmd.exe"
+      $psi2.Arguments = "/c " + $cmd
+      $psi2.RedirectStandardOutput = $true
+      $psi2.RedirectStandardError  = $true
+      $psi2.RedirectStandardInput = $true
+      $psi2.UseShellExecute = $false
+      $psi2.CreateNoWindow = $true
 
-  if ($useCmd) {
-    $psi2 = New-Object System.Diagnostics.ProcessStartInfo
-    $psi2.FileName = "cmd.exe"
-    $psi2.Arguments = "/c " + $cmd
-    $psi2.RedirectStandardOutput = $true
-    $psi2.RedirectStandardError  = $true
-    $psi2.RedirectStandardInput = $true
-    $psi2.UseShellExecute = $false
-    $psi2.CreateNoWindow = $true
-
-    $p2 = New-Object System.Diagnostics.Process
-    $p2.StartInfo = $psi2
-    $p2.Start() | Out-Null
-    if ($stdinData -ne $null -and $stdinData.Length -gt 0) {
-      try { $p2.StandardInput.Write($stdinData) } catch {}
+      $p2 = New-Object System.Diagnostics.Process
+      $p2.StartInfo = $psi2
+      $p2.Start() | Out-Null
+      if ($stdinData -ne $null -and $stdinData.Length -gt 0) { try { $p2.StandardInput.Write($stdinData) } catch {} }
+      try { $p2.StandardInput.Close() } catch {}
+      $out2 = $p2.StandardOutput.ReadToEnd()
+      $err2 = $p2.StandardError.ReadToEnd()
+      $p2.WaitForExit()
+      $sw.Stop()
+      $realMs2 = [int]$sw.ElapsedMilliseconds
+      $observed2 = 0
+      try {
+        while (-not $p2.HasExited) {
+          try { $val2 = SumProcessTreeCpu($p2.Id); if ($val2 -gt $observed2) { $observed2 = $val2 } } catch {}
+          Start-Sleep -Milliseconds 50
+        }
+        try { $val2 = SumProcessTreeCpu($p2.Id); if ($val2 -gt $observed2) { $observed2 = $val2 } } catch {}
+      } catch {}
+      EmitResult $observed2 $realMs2 $out2 $err2 $p2.ExitCode
+      exit 0
     }
-    try { $p2.StandardInput.Close() } catch {}
-    $out2 = $p2.StandardOutput.ReadToEnd()
-    $err2 = $p2.StandardError.ReadToEnd()
-    $p2.WaitForExit()
+  } else {
+    # nothing to run
     $sw.Stop()
-    $realMs2 = [int]$sw.ElapsedMilliseconds
-    $cpuMainMs2 = 0
-    try { $cpuMainMs2 = [int]([math]::Round($p2.TotalProcessorTime.TotalMilliseconds)) } catch {}
-    EmitResult $cpuMainMs2 $realMs2 $out2 $err2 $p2.ExitCode
+    EmitResult 0 ([int]$sw.ElapsedMilliseconds) "" "" -1
     exit 0
   }
 } catch {
@@ -576,18 +613,24 @@ try {
         runningProcesses.set(seedSafeForTracking, (runningProcesses.get(seedSafeForTracking) || []).concat([proc]));
         let collected = Buffer.alloc(0);
         let stderrAll = "";
-        if (proc.stdout) proc.stdout.on("data", (b: Buffer) => { collected = Buffer.concat([collected, b]); if (collected.length > maxOutputBytes) try { killProcGroup(proc); } catch {} });
+        let timedOut = false;
+        if (proc.stdout) proc.stdout.on("data", (b: Buffer) => { collected = Buffer.concat([collected, b]); if (collected.length > maxOutputBytes) { try { timedOut = true; killProcGroup(proc); } catch {} } });
         if (proc.stderr) proc.stderr.on("data", (d: Buffer) => { stderrAll += d.toString(); });
         if (stdinStream && proc.stdin) { stdinStream.pipe(proc.stdin); } else if (proc.stdin) { try { proc.stdin.end(); } catch {} }
         const start = Date.now();
-        const timer = setTimeout(() => { try { killProcGroup(proc); } catch {} }, timeoutMs);
+        const timer = setTimeout(() => { try { timedOut = true; killProcGroup(proc); } catch {} }, timeoutMs);
         proc.on("close", (code) => {
           clearTimeout(timer);
           const end = Date.now();
           const realMs = end - start;
           const arr = runningProcesses.get(seedSafeForTracking) || [];
           runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
-          resolve({ exitCode: code ?? 0, stdout: collected.toString("utf8"), stderr: stderrAll, realTimeMs: realMs, exitSignal: null });
+          if (timedOut) {
+            const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
+            resolve({ exitCode: null, stdout: collected.toString("utf8"), stderr: stderrTimed, realTimeMs: realMs, exitSignal: 'TIMEOUT' });
+          } else {
+            resolve({ exitCode: code === null ? null : code, stdout: collected.toString("utf8"), stderr: stderrAll, realTimeMs: realMs, exitSignal: null });
+          }
         });
         proc.on("error", (err) => {
           clearTimeout(timer);
@@ -605,6 +648,7 @@ try {
 
       let collected = Buffer.alloc(0);
       let stderrAll = "";
+      let timedOut = false;
       if (proc.stdout) proc.stdout.on("data", (b: Buffer) => { collected = Buffer.concat([collected, b]); if (collected.length > maxOutputBytes) try { killProcGroup(proc); } catch {} });
       if (proc.stderr) proc.stderr.on("data", (d: Buffer) => { stderrAll += d.toString(); });
 
@@ -614,7 +658,7 @@ try {
         try { proc.stdin.end(); } catch {}
       }
 
-      const timer = setTimeout(() => { try { killProcGroup(proc); } catch {} }, timeoutMs);
+      const timer = setTimeout(() => { try { timedOut = true; killProcGroup(proc); } catch {} }, timeoutMs);
 
       proc.on("close", (code) => {
         clearTimeout(timer);
@@ -630,17 +674,32 @@ try {
             const stderrFrom = typeof obj.stderr === "string" ? obj.stderr : "";
             const stderrAllCombined = stderrAll + (stderrFrom ? ("\n" + stderrFrom) : "");
             try { fs.unlinkSync(psPath); } catch {}
-            resolve({ exitCode: obj.exit ?? code ?? 0, stdout: stdout, stderr: stderrAllCombined, cpuTimeMs: cpu, realTimeMs: real, exitSignal: null });
+            if (timedOut) {
+              const stderrTimed = stderrAllCombined + "\n*** Process killed due to timeout ***";
+              resolve({ exitCode: null, stdout: stdout, stderr: stderrTimed, cpuTimeMs: cpu, realTimeMs: real, exitSignal: 'TIMEOUT' });
+            } else {
+              resolve({ exitCode: obj.exit ?? (code === null ? null : code), stdout: stdout, stderr: stderrAllCombined, cpuTimeMs: cpu, realTimeMs: real, exitSignal: null });
+            }
             return;
           } else {
             try { fs.unlinkSync(psPath); } catch {}
-            resolve({ exitCode: code ?? 0, stdout: "", stderr: stderrAll, exitSignal: null });
+            if (timedOut) {
+              const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
+              resolve({ exitCode: null, stdout: "", stderr: stderrTimed, exitSignal: 'TIMEOUT' });
+            } else {
+              resolve({ exitCode: code === null ? null : code, stdout: "", stderr: stderrAll, exitSignal: null });
+            }
             return;
           }
         } catch (e) {
           if (outputChannel) { outputChannel.appendLine(`Failed to parse PowerShell wrapper output: ${String(e)}`); outputChannel.show(true); }
           try { fs.unlinkSync(psPath); } catch {}
-          resolve({ exitCode: code ?? 0, stdout: txt, stderr: stderrAll, exitSignal: null });
+          if (timedOut) {
+            const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
+            resolve({ exitCode: null, stdout: txt, stderr: stderrTimed, exitSignal: 'TIMEOUT' });
+          } else {
+            resolve({ exitCode: code === null ? null : code, stdout: txt, stderr: stderrAll, exitSignal: null });
+          }
         }
       });
 
@@ -657,8 +716,9 @@ try {
 
 
 // ---- runSingleSeed: generator -> main ----
-async function runSingleSeed(seed: string, cfg: any, root: string, outputDir: string, outputChannel: vscode.OutputChannel, timeoutMsOverride?: number): Promise<{ seed: string; ok: boolean; exitCode?: number; err?: string; stdout?: string; mainTimeMs?: number; realTimeMs?: number; stage?: string }> {
-  const timeoutMs = timeoutMsOverride ?? (Number(cfg.timeoutMs) || defaultCfg().timeoutMs);
+async function runSingleSeed(seed: string, cfg: any, root: string, outputDir: string, outputChannel: vscode.OutputChannel, timeoutMsOverride?: number): Promise<{ seed: string; ok: boolean; exitCode?: number; err?: string; stdout?: string; mainTimeMs?: number; realTimeMs?: number; stage?: string; parsedScore?: number }> {
+  const mainTimeoutMs = timeoutMsOverride ?? (Number(cfg.timeoutMsMain) || defaultCfg().timeoutMsMain);
+  const genTimeoutMs = Number(cfg.timeoutMsGen) || defaultCfg().timeoutMsGen;
   const maxOutputBytes = Number(cfg.maxOutputBytes) || defaultCfg().maxOutputBytes;
 
   const wrapperName = `__npc_wrapper_${safeFilenamePart(seed)}_${randomBytes(6).toString("hex")}.py`;
@@ -688,7 +748,7 @@ async function runSingleSeed(seed: string, cfg: any, root: string, outputDir: st
 
     if (outputChannel) outputChannel.appendLine(`Spawning generator: ${genCommand}`);
     const genPromise = new Promise<void>((resolve) => {
-      const genTimeout = setTimeout(() => { try { killProcGroup(genProc); } catch {} genExitCode = -1; resolve(); }, timeoutMs);
+      const genTimeout = setTimeout(() => { try { killProcGroup(genProc); } catch {} genExitCode = -1; resolve(); }, genTimeoutMs);
       genProc.on("close", (code) => { clearTimeout(genTimeout); genExitCode = code ?? 0; resolve(); });
       genProc.on("error", () => { clearTimeout(genTimeout); genExitCode = -1; resolve(); });
     });
@@ -730,7 +790,7 @@ async function runSingleSeed(seed: string, cfg: any, root: string, outputDir: st
     let rs: fs.ReadStream | null = null;
     try { rs = fs.createReadStream(inFile); } catch { rs = null; }
 
-    const runResult = await runCommandCapture(runCommand, root, rs, timeoutMs, maxOutputBytes, seedSafe, outputChannel);
+    const runResult = await runCommandCapture(runCommand, root, rs, mainTimeoutMs, maxOutputBytes, seedSafe, outputChannel);
     const outString = runResult.stdout ?? "";
     const code = runResult.exitCode ?? -1;
     const cpuMs = (typeof runResult.cpuTimeMs === 'number' && !isNaN(runResult.cpuTimeMs)) ? runResult.cpuTimeMs : 0;
@@ -740,6 +800,11 @@ async function runSingleSeed(seed: string, cfg: any, root: string, outputDir: st
 
     if (outString && outString.length > 0) {
       try { fs.writeFileSync(path.join(outputsDir, `out_${seedSafe}.txt`), outString, "utf8"); } catch {}
+    }
+
+    // detect timeout: runCommandCapture returns exitCode === null when killed by our timeout
+    if (runResult.exitCode === null || /Process killed due to timeout|\*\*\* Process killed due to timeout \*\*\*/i.test(runResult.stderr || "") || runResult.exitSignal === 'TIMEOUT' || runResult.exitSignal === 'SIGKILL') {
+      return { seed, ok: false, err: 'TLE', stage: 'run', parsedScore: -1 };
     }
 
     if (code !== 0) {
@@ -760,7 +825,7 @@ async function runSingleSeed(seed: string, cfg: any, root: string, outputDir: st
 
 // ---- runScorer: runs scorer with NPC_SHARED_FILE env var; parse numeric score; -1 => WA ----
 async function runScorer(seed: string, cfg: any, root: string, outputDir: string, outputChannel: vscode.OutputChannel, timeoutMsOverride?: number): Promise<{ ok: boolean; exitCode?: number; err?: string; stdout?: string; parsedScore?: number; stage?: string }> {
-  const timeoutMs = timeoutMsOverride ?? (Number(cfg.timeoutMs) || defaultCfg().timeoutMs);
+  const timeoutMs = timeoutMsOverride ?? (Number(cfg.timeoutMsScorer) || defaultCfg().timeoutMsScorer);
   const maxOutputBytes = Number(cfg.maxOutputBytes) || defaultCfg().maxOutputBytes;
   const seedSafe = safeFilenamePart(seed);
   const outputsDir = path.join(outputDir, "outputs");
@@ -785,6 +850,7 @@ async function runScorer(seed: string, cfg: any, root: string, outputDir: string
     let collected = Buffer.alloc(0);
     let stderrAll = "";
     let exceeded = false;
+    let timedOut = false;
     if (proc.stderr) proc.stderr.on("data", d => { stderrAll += d.toString(); });
         if (proc.stdout) {
       proc.stdout.on("data", (chunk: Buffer) => {
@@ -796,7 +862,7 @@ async function runScorer(seed: string, cfg: any, root: string, outputDir: string
     const rs = fs.createReadStream(mainOutFile);
     rs.pipe(proc.stdin);
 
-    const timeout = setTimeout(() => { try { killProcGroup(proc); } catch {} }, timeoutMs);
+    const timeout = setTimeout(() => { try { timedOut = true; killProcGroup(proc); } catch {} }, timeoutMs);
     const code = await new Promise<number | null>((resolve) => {
       proc.on("close", (c) => { clearTimeout(timeout); resolve(c ?? 0); });
       proc.on("error", () => { clearTimeout(timeout); resolve(-1); });
@@ -805,6 +871,9 @@ async function runScorer(seed: string, cfg: any, root: string, outputDir: string
 
     if (exceeded) {
       return { ok: false, exitCode: code ?? undefined, err: "Scorer output exceeded limit", stdout: outString, stage: 'scorer' };
+    }
+    if (timedOut) {
+      return { ok: false, exitCode: code ?? undefined, err: 'TLE', stdout: outString, parsedScore: -1, stage: 'scorer' };
     }
     if (code !== 0) {
       return { ok: false, exitCode: code ?? undefined, err: `Scorer exited with code ${code}. stderr:\n${stderrAll}`, stdout: outString, stage: 'scorer' };
@@ -1035,7 +1104,9 @@ export function activate(context: vscode.ExtensionContext) {
         pythonPath: config.get("pythonPath") || defaultCfg().pythonPath,
         genFilename: config.get("genFilename") || defaultCfg().genFilename,
         mainFilename: config.get("mainFilename") || defaultCfg().mainFilename,
-        timeoutMs: config.get("timeoutMs") ?? defaultCfg().timeoutMs,
+        timeoutMsGen: config.get("timeoutMsGen") ?? defaultCfg().timeoutMsGen,
+        timeoutMsMain: config.get("timeoutMsMain") ?? defaultCfg().timeoutMsMain,
+        timeoutMsScorer: config.get("timeoutMsScorer") ?? defaultCfg().timeoutMsScorer,
         maxOutputBytes: config.get("maxOutputBytes") ?? defaultCfg().maxOutputBytes,
         outputDir: config.get("outputDir") || defaultCfg().outputDir,
         threads: config.get("threads") ?? defaultCfg().threads,
@@ -1143,7 +1214,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         const worker = async () => {
           // per-worker warmup to reduce first-run overhead
-          try { await runWarmup(root, Number(cfg.timeoutMs) || defaultCfg().timeoutMs, outputChannel); } catch {}
+          try { await runWarmup(root, Math.max(1000, Number(cfg.timeoutMsGen) || defaultCfg().timeoutMsGen), outputChannel); } catch {}
           while (true) {
             if (cancelled) return;
             const myIndex = idx;
@@ -1223,7 +1294,9 @@ export function activate(context: vscode.ExtensionContext) {
         pythonPath: config.get("pythonPath") || defaultCfg().pythonPath,
         genFilename: config.get("genFilename") || defaultCfg().genFilename,
         mainFilename: config.get("mainFilename") || defaultCfg().mainFilename,
-        timeoutMs: config.get("timeoutMs") ?? defaultCfg().timeoutMs,
+        timeoutMsGen: config.get("timeoutMsGen") ?? defaultCfg().timeoutMsGen,
+        timeoutMsMain: config.get("timeoutMsMain") ?? defaultCfg().timeoutMsMain,
+        timeoutMsScorer: config.get("timeoutMsScorer") ?? defaultCfg().timeoutMsScorer,
         maxOutputBytes: config.get("maxOutputBytes") ?? defaultCfg().maxOutputBytes,
         outputDir: config.get("outputDir") || defaultCfg().outputDir,
         threads: config.get("threads") ?? defaultCfg().threads,
@@ -1378,7 +1451,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         const worker = async () => {
           // per-worker warmup to reduce first-run overhead
-          try { await runWarmup(root, Number(cfg.timeoutMs) || defaultCfg().timeoutMs, outputChannel); } catch {}
+          try { await runWarmup(root, Math.max(1000, Number(cfg.timeoutMsGen) || defaultCfg().timeoutMsGen), outputChannel); } catch {}
           while (true) {
             if (cancelled) return;
             const myIndex = idx;
@@ -1403,6 +1476,11 @@ export function activate(context: vscode.ExtensionContext) {
                 scorer_stdout: null,
                 scorer_score: null
               };
+
+              // if main was TLE, mark score = -1 to be consistent with judge behavior
+              if (!r.ok && r.err && /TLE|timed|timeout/i.test(String(r.err))) {
+                try { resObj.scorer_score = -1; } catch {}
+              }
 
               if (r.ok) {
                 outputChannel.appendLine(`Seed ${s}: main OK (cpu=${r.mainTimeMs ?? "N/A"} ms realtime=${r.realTimeMs ?? "N/A"} ms) — running scorer...`);
@@ -1549,7 +1627,9 @@ export function activate(context: vscode.ExtensionContext) {
         pythonPath: config.get("pythonPath") || defaultCfg().pythonPath,
         genFilename: config.get("genFilename") || defaultCfg().genFilename,
         mainFilename: config.get("mainFilename") || defaultCfg().mainFilename,
-        timeoutMs: config.get("timeoutMs") ?? defaultCfg().timeoutMs,
+        timeoutMsGen: config.get("timeoutMsGen") ?? defaultCfg().timeoutMsGen,
+        timeoutMsMain: config.get("timeoutMsMain") ?? defaultCfg().timeoutMsMain,
+        timeoutMsScorer: config.get("timeoutMsScorer") ?? defaultCfg().timeoutMsScorer,
         maxOutputBytes: config.get("maxOutputBytes") ?? defaultCfg().maxOutputBytes,
         outputDir: config.get("outputDir") || defaultCfg().outputDir,
         threads: config.get("threads") ?? defaultCfg().threads,
@@ -1726,7 +1806,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         const worker = async () => {
           // per-worker warmup to reduce first-run overhead
-          try { await runWarmup(root, Number(cfg.timeoutMs) || defaultCfg().timeoutMs, outputChannel); } catch {}
+          try { await runWarmup(root, Math.max(1000, Number(cfg.timeoutMsGen) || defaultCfg().timeoutMsGen), outputChannel); } catch {}
           while (true) {
             if (cancelled) return;
             const myIndex = idx;
@@ -1749,7 +1829,7 @@ export function activate(context: vscode.ExtensionContext) {
                 if (cancelled) break;
                 outputChannel.appendLine(`Seed ${s}: attempt ${attempt}/${attempts}`);
                 // choose a real-time timeout to pass to runSingleSeed so we don't wait forever.
-                const timeoutForThisRun = Math.max(Number(cfg.timeoutMs) || defaultCfg().timeoutMs, timeLimitMs * realTimeoutFactor + 1000);
+                const timeoutForThisRun = Math.max(Number(cfg.timeoutMsMain) || defaultCfg().timeoutMsMain, timeLimitMs * realTimeoutFactor + 1000);
                 const r = await runSingleSeed(s, cfg, root, outdir, outputChannel, timeoutForThisRun);
                 lastRun = r;
                 attemptsList.push(r);
@@ -1838,7 +1918,7 @@ export function activate(context: vscode.ExtensionContext) {
                     scorer_exitCode: null,
                     scorer_err: null,
                     scorer_stdout: null,
-                    scorer_score: null
+                    scorer_score: -1
                   };
                   outputChannel.appendLine(`Seed ${s}: all attempts exceeded time limit -> marked TLE/ERR (see err); reported time set to fastest attempt if available`);
                 } else {
@@ -1848,7 +1928,8 @@ export function activate(context: vscode.ExtensionContext) {
                     main_err: `TLE`,
                     main_stdout: null,
                     mainTimeMs: null,
-                    realTimeMs: null
+                    realTimeMs: null,
+                    scorer_score: -1
                   };
                   outputChannel.appendLine(`Seed ${s}: no run information available -> marked TLE`);
                 }
