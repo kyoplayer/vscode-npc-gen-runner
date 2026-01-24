@@ -1115,7 +1115,16 @@ export function activate(context: vscode.ExtensionContext) {
         mainBuildEnabled: config.get("mainBuildEnabled") ?? defaultCfg().mainBuildEnabled,
         mainRunCommand: config.get("mainRunCommand") || defaultCfg().mainRunCommand,
         mainExec: config.get("mainExec") || defaultCfg().mainExec,
+        scorerFilename: config.get("scorerFilename") || defaultCfg().scorerFilename,
+        scorerRunCommand: config.get("scorerRunCommand") || defaultCfg().scorerRunCommand,
+        scorerExec: config.get("scorerExec") || defaultCfg().scorerExec,
+        scorerBuildCommand: config.get("scorerBuildCommand") || defaultCfg().scorerBuildCommand,
+        scorerBuildEnabled: config.get("scorerBuildEnabled") ?? defaultCfg().scorerBuildEnabled,
         sharedVars: config.get("sharedVars") ?? defaultCfg().sharedVars
+        // judge related settings (used to treat TLEs like judge does)
+      ,  judgeTimeLimitMs: config.get("judgeTimeLimitMs") ?? defaultCfg().judgeTimeLimitMs
+      ,  judgeRetries: config.get("judgeRetries") ?? defaultCfg().judgeRetries
+      ,  judgeRealTimeoutFactor: config.get("judgeRealTimeoutFactor") ?? defaultCfg().judgeRealTimeoutFactor
       };
 
       const urlOrShort = await vscode.window.showInputBox({ prompt: "Enter NPC short (NPC004B) or full URL to fetch generator (leave empty to use existing gen.py)" });
@@ -1224,13 +1233,103 @@ export function activate(context: vscode.ExtensionContext) {
             progress.report({ message: `Running seed ${s} (${myIndex + 1}/${total})`, increment: (100 / total) });
             outputChannel.appendLine(`=== Seed ${s} ===`);
             try {
-              const r = await runSingleSeed(s, cfg, root, outdir, outputChannel);
-              results[myIndex] = r;
-              if (r.ok) {
-                outputChannel.appendLine(`Seed ${s}: OK (cpu=${r.mainTimeMs ?? "N/A"} ms realtime=${r.realTimeMs ?? "N/A"} ms)`);
-              } else {
-                outputChannel.appendLine(`Seed ${s}: FAILED during ${r.stage ?? 'unknown'} - ${r.err}`);
+              // Retry logic to mimic judge behavior: try up to cfg.judgeRetries
+              const attempts = Math.max(1, Number(cfg.judgeRetries) || 1);
+              const timeLimitMs = Number(cfg.judgeTimeLimitMs) || defaultCfg().judgeTimeLimitMs;
+              const realTimeoutFactor = Number(cfg.judgeRealTimeoutFactor) || defaultCfg().judgeRealTimeoutFactor;
+              let acceptedRun: any = null;
+              let lastRun: any = null;
+              const attemptsList: any[] = [];
+              for (let attempt = 1; attempt <= attempts; attempt++) {
+                if (cancelled) break;
+                outputChannel.appendLine(`Seed ${s}: attempt ${attempt}/${attempts}`);
+                const timeoutForThisRun = Math.max(Number(cfg.timeoutMsMain) || defaultCfg().timeoutMsMain, timeLimitMs * realTimeoutFactor + 1000);
+                const r = await runSingleSeed(s, cfg, root, outdir, outputChannel, timeoutForThisRun);
+                lastRun = r;
+                attemptsList.push(r);
+                const measuredMs = (typeof r.mainTimeMs === "number" && !isNaN(r.mainTimeMs)) ? r.mainTimeMs : r.realTimeMs;
+                const measuredStr = typeof measuredMs === "number" ? `${measuredMs} ms` : "N/A";
+                outputChannel.appendLine(`Seed ${s}: attempt ${attempt} result: ok=${r.ok} measured=${measuredStr} stage=${r.stage ?? 'unknown'} err=${r.err ?? ""}`);
+                if (r.ok && typeof measuredMs === "number" && measuredMs <= timeLimitMs) {
+                  acceptedRun = r;
+                  outputChannel.appendLine(`Seed ${s}: accepted on attempt ${attempt} (measured ${measuredMs} ms <= ${timeLimitMs} ms)`);
+                  break;
+                }
               }
+
+              const resObj: any = {
+                seed: s,
+                main_ok: false,
+                main_exitCode: null,
+                main_err: null,
+                main_stdout: null,
+                mainTimeMs: null,
+                realTimeMs: null,
+                scorer_ok: null,
+                scorer_exitCode: null,
+                scorer_err: null,
+                scorer_stdout: null,
+                scorer_score: null
+              };
+
+              if (acceptedRun) {
+                resObj.main_ok = true;
+                resObj.main_exitCode = acceptedRun.exitCode;
+                resObj.main_err = acceptedRun.err;
+                resObj.main_stdout = acceptedRun.stdout;
+                resObj.mainTimeMs = acceptedRun.mainTimeMs;
+                resObj.realTimeMs = acceptedRun.realTimeMs;
+                outputChannel.appendLine(`Seed ${s}: OK (cpu=${resObj.mainTimeMs ?? "N/A"} ms realtime=${resObj.realTimeMs ?? "N/A"} ms) — running scorer...`);
+                if (await fileExists(path.join(root, String(cfg.scorerFilename)))) {
+                  try {
+                    const sc = await runScorer(s, cfg, root, outdir, outputChannel);
+                    resObj.scorer_ok = sc.ok;
+                    resObj.scorer_exitCode = sc.exitCode;
+                    resObj.scorer_err = sc.err;
+                    resObj.scorer_stdout = sc.stdout;
+                    resObj.scorer_score = sc.parsedScore ?? null;
+                    if (sc.ok) {
+                      outputChannel.appendLine(`Seed ${s}: scorer OK (score: ${sc.parsedScore ?? "N/A"})`);
+                    } else {
+                      outputChannel.appendLine(`Seed ${s}: scorer FAILED - ${sc.err}`);
+                    }
+                  } catch (e:any) {
+                    resObj.scorer_ok = false;
+                    resObj.scorer_err = String(e);
+                    outputChannel.appendLine(`Seed ${s}: scorer exception - ${String(e)}`);
+                  }
+                } else {
+                  outputChannel.appendLine(`Seed ${s}: scorer not found — skipping scorer.`);
+                }
+              } else {
+                // no accepted run within retries -> mark TLE and set score -1
+                if (lastRun) {
+                  let fastestMs: number | null = null;
+                  let fastestReal: number | null = null;
+                  for (const a of attemptsList) {
+                    const m = (typeof a.mainTimeMs === "number" && !isNaN(a.mainTimeMs)) ? a.mainTimeMs : a.realTimeMs;
+                    if (typeof m === "number") {
+                      if (fastestMs === null || m < fastestMs) {
+                        fastestMs = m;
+                        fastestReal = a.realTimeMs ?? null;
+                      }
+                    }
+                  }
+                  resObj.main_ok = false;
+                  resObj.main_exitCode = lastRun.exitCode;
+                  resObj.main_err = lastRun.err || 'TLE';
+                  resObj.main_stdout = lastRun.stdout;
+                  resObj.mainTimeMs = fastestMs !== null ? fastestMs : lastRun.mainTimeMs;
+                  resObj.realTimeMs = fastestReal !== null ? fastestReal : lastRun.realTimeMs;
+                } else {
+                  resObj.main_ok = false;
+                  resObj.main_err = 'TLE';
+                }
+                resObj.scorer_score = -1;
+                outputChannel.appendLine(`Seed ${s}: all attempts exceeded time limit -> marked TLE`);
+              }
+
+              results[myIndex] = resObj;
             } catch (e:any) {
               outputChannel.appendLine(`Seed ${s}: Exception - ${String(e)}`);
               results[myIndex] = { seed: s, ok: false, err: String(e) };
@@ -1311,6 +1410,10 @@ export function activate(context: vscode.ExtensionContext) {
         scorerBuildCommand: config.get("scorerBuildCommand") || defaultCfg().scorerBuildCommand,
         scorerBuildEnabled: config.get("scorerBuildEnabled") ?? defaultCfg().scorerBuildEnabled,
         sharedVars: config.get("sharedVars") ?? defaultCfg().sharedVars,
+        // judge configs for heuristic retry behavior
+        judgeTimeLimitMs: config.get("judgeTimeLimitMs") ?? defaultCfg().judgeTimeLimitMs,
+        judgeRetries: config.get("judgeRetries") ?? defaultCfg().judgeRetries,
+        judgeRealTimeoutFactor: config.get("judgeRealTimeoutFactor") ?? defaultCfg().judgeRealTimeoutFactor,
       };
 
       const urlOrShort = await vscode.window.showInputBox({ prompt: "Enter NPC short (NPC004B) or full URL to fetch generator (leave empty to use existing gen.py)" });
@@ -1461,15 +1564,38 @@ export function activate(context: vscode.ExtensionContext) {
             progress.report({ message: `Running seed ${s} (${myIndex + 1}/${total})`, increment: (100 / total) });
             outputChannel.appendLine(`=== Heuristic Seed ${s} ===`);
             try {
-              const r = await runSingleSeed(s, cfg, root, outdir, outputChannel);
+              // Retry logic: attempt up to judgeRetries to obtain a run within judgeTimeLimitMs
+              const attempts = Math.max(1, Number(cfg.judgeRetries) || 1);
+              const timeLimitMs = Number(cfg.judgeTimeLimitMs) || defaultCfg().judgeTimeLimitMs;
+              const realTimeoutFactor = Number(cfg.judgeRealTimeoutFactor) || defaultCfg().judgeRealTimeoutFactor;
+              let acceptedRun: any = null;
+              let lastRun: any = null;
+              const attemptsList: any[] = [];
+              for (let attempt = 1; attempt <= attempts; attempt++) {
+                if (cancelled) break;
+                outputChannel.appendLine(`Seed ${s}: attempt ${attempt}/${attempts}`);
+                const timeoutForThisRun = Math.max(Number(cfg.timeoutMsMain) || defaultCfg().timeoutMsMain, timeLimitMs * realTimeoutFactor + 1000);
+                const r = await runSingleSeed(s, cfg, root, outdir, outputChannel, timeoutForThisRun);
+                lastRun = r;
+                attemptsList.push(r);
+                const measuredMs = (typeof r.mainTimeMs === "number" && !isNaN(r.mainTimeMs)) ? r.mainTimeMs : r.realTimeMs;
+                const measuredStr = typeof measuredMs === "number" ? `${measuredMs} ms` : "N/A";
+                outputChannel.appendLine(`Seed ${s}: attempt ${attempt} result: ok=${r.ok} measured=${measuredStr} stage=${r.stage ?? 'unknown'} err=${r.err ?? ""}`);
+                if (r.ok && typeof measuredMs === "number" && measuredMs <= timeLimitMs) {
+                  acceptedRun = r;
+                  outputChannel.appendLine(`Seed ${s}: accepted on attempt ${attempt} (measured ${measuredMs} ms <= ${timeLimitMs} ms)`);
+                  break;
+                }
+              }
+
               const resObj: any = {
                 seed: s,
-                main_ok: r.ok ?? false,
-                main_exitCode: r.exitCode,
-                main_err: r.err,
-                main_stdout: r.stdout,
-                mainTimeMs: r.mainTimeMs,
-                realTimeMs: r.realTimeMs,
+                main_ok: false,
+                main_exitCode: null,
+                main_err: null,
+                main_stdout: null,
+                mainTimeMs: null,
+                realTimeMs: null,
                 scorer_ok: null,
                 scorer_exitCode: null,
                 scorer_err: null,
@@ -1477,13 +1603,14 @@ export function activate(context: vscode.ExtensionContext) {
                 scorer_score: null
               };
 
-              // if main was TLE, mark score = -1 to be consistent with judge behavior
-              if (!r.ok && r.err && /TLE|timed|timeout/i.test(String(r.err))) {
-                try { resObj.scorer_score = -1; } catch {}
-              }
-
-              if (r.ok) {
-                outputChannel.appendLine(`Seed ${s}: main OK (cpu=${r.mainTimeMs ?? "N/A"} ms realtime=${r.realTimeMs ?? "N/A"} ms) — running scorer...`);
+              if (acceptedRun) {
+                resObj.main_ok = true;
+                resObj.main_exitCode = acceptedRun.exitCode;
+                resObj.main_err = acceptedRun.err;
+                resObj.main_stdout = acceptedRun.stdout;
+                resObj.mainTimeMs = acceptedRun.mainTimeMs;
+                resObj.realTimeMs = acceptedRun.realTimeMs;
+                outputChannel.appendLine(`Seed ${s}: main OK (cpu=${resObj.mainTimeMs ?? "N/A"} ms realtime=${resObj.realTimeMs ?? "N/A"} ms) — running scorer...`);
                 if (await fileExists(path.join(root, String(cfg.scorerFilename)))) {
                   try {
                     const sc = await runScorer(s, cfg, root, outdir, outputChannel);
@@ -1506,7 +1633,31 @@ export function activate(context: vscode.ExtensionContext) {
                   outputChannel.appendLine(`Seed ${s}: scorer not found — skipping scorer.`);
                 }
               } else {
-                outputChannel.appendLine(`Seed ${s}: main FAILED during ${r.stage ?? 'run'} - ${r.err} (skip scorer)`);
+                // no accepted run within retries -> mark TLE and set score -1
+                if (lastRun) {
+                  let fastestMs: number | null = null;
+                  let fastestReal: number | null = null;
+                  for (const a of attemptsList) {
+                    const m = (typeof a.mainTimeMs === "number" && !isNaN(a.mainTimeMs)) ? a.mainTimeMs : a.realTimeMs;
+                    if (typeof m === "number") {
+                      if (fastestMs === null || m < fastestMs) {
+                        fastestMs = m;
+                        fastestReal = a.realTimeMs ?? null;
+                      }
+                    }
+                  }
+                  resObj.main_ok = false;
+                  resObj.main_exitCode = lastRun.exitCode;
+                  resObj.main_err = lastRun.err || 'TLE';
+                  resObj.main_stdout = lastRun.stdout;
+                  resObj.mainTimeMs = fastestMs !== null ? fastestMs : lastRun.mainTimeMs;
+                  resObj.realTimeMs = fastestReal !== null ? fastestReal : lastRun.realTimeMs;
+                } else {
+                  resObj.main_ok = false;
+                  resObj.main_err = 'TLE';
+                }
+                resObj.scorer_score = -1;
+                outputChannel.appendLine(`Seed ${s}: all attempts exceeded time limit -> marked TLE`);
               }
 
               results[myIndex] = resObj;

@@ -2,7 +2,7 @@
   "name": "vscode-npc-gen-runner",
   "displayName": "NPC Gen Runner",
   "description": "Fetch generator from contest pages and run user solutions with generated seeds.",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "publisher": "kyoplayer",
   "engines": {
     "vscode": "^1.60.0"
