@@ -139,7 +139,82 @@ function whichSync(cmd: string): string | null {
 }
 
 // C wrapper source used to measure child CPU time with microsecond precision
-const TIME_WRAPPER_C = `#include <sys/time.h>
+// Modified to support Windows (MinGW) via Job Objects
+const TIME_WRAPPER_C = `#ifdef _WIN32
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <cmd> <outfile>\\n", argv[0]);
+        return 2;
+    }
+    char* cmd = argv[1];
+    char* outfile = argv[2];
+
+    HANDLE hJob = CreateJobObject(NULL, NULL);
+    if (!hJob) {
+        fprintf(stderr, "CreateJobObject failed: %d\\n", (int)GetLastError());
+        return 2;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcess(NULL, cmd, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "CreateProcess failed: %d\\n", (int)GetLastError());
+        CloseHandle(hJob);
+        return 2;
+    }
+
+    if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+        fprintf(stderr, "AssignProcessToJobObject failed: %d\\n", (int)GetLastError());
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(hJob);
+        return 2;
+    }
+
+    ResumeThread(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION jobInfo = { 0 };
+    double cpu_sec = 0.0;
+    if (QueryInformationJobObject(hJob, JobObjectBasicAccountingInformation, &jobInfo, sizeof(jobInfo))) {
+        long long total = jobInfo.TotalUserTime.QuadPart + jobInfo.TotalKernelTime.QuadPart;
+        cpu_sec = (double)total / 10000000.0;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(hJob);
+
+    FILE* f = fopen(outfile, "w");
+    if (f) {
+        fprintf(f, "%.6f 0.000000\\n", cpu_sec);
+        fclose(f);
+    }
+    return (int)exitCode;
+}
+#else
+#include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <stdlib.h>
@@ -149,7 +224,7 @@ const TIME_WRAPPER_C = `#include <sys/time.h>
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    fprintf(stderr, "Usage: %s <cmd> <outfile>\n", argv[0]);
+    fprintf(stderr, "Usage: %s <cmd> <outfile>\\n", argv[0]);
     return 2;
   }
   const char* cmd = argv[1];
@@ -171,28 +246,36 @@ int main(int argc, char** argv) {
     double sys = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
     FILE* f = fopen(outfile, "w");
     if (f) {
-      fprintf(f, "%.6f %.6f\n", user, sys);
+      fprintf(f, "%.6f %.6f\\n", user, sys);
       fclose(f);
     } else {
-      fprintf(stderr, "Failed to open %s for writing\n", outfile);
+      fprintf(stderr, "Failed to open %s for writing\\n", outfile);
     }
     return WIFEXITED(status) ? WEXITSTATUS(status) : 0;
   }
 }
+#endif
 `;
 
+// IMPROVEMENT: Cache the check result so we only try to find/compile gcc ONCE per session
+let timeWrapperChecked = false;
 let cachedTimeWrapperPath: string | null = null;
+
 function ensureTimeWrapper(outputChannel?: vscode.OutputChannel): string | null {
-  if (cachedTimeWrapperPath) return cachedTimeWrapperPath;
+  if (timeWrapperChecked) return cachedTimeWrapperPath;
+  timeWrapperChecked = true; // Mark as checked immediately
+
   const cc = whichSync('gcc') || whichSync('cc');
   if (!cc) {
     if (outputChannel) outputChannel.appendLine('Time wrapper: no C compiler found (gcc/cc)');
     return null;
   }
-    try {
-    // use a stable path so it's easy to inspect and reuse across runs
-    const bin = path.join(os.tmpdir(), `npc_time_wrapper`);
+  
+  try {
+    const bin = path.join(os.tmpdir(), `npc_time_wrapper` + (process.platform === 'win32' ? '.exe' : ''));
     const src = bin + '.c';
+    
+    // Check if binary exists. If not, try to compile.
     if (!fs.existsSync(bin)) {
       if (outputChannel) outputChannel.appendLine(`Time wrapper: writing source to ${src} and compiling with ${cc}`);
       fs.writeFileSync(src, TIME_WRAPPER_C, 'utf8');
@@ -200,7 +283,6 @@ function ensureTimeWrapper(outputChannel?: vscode.OutputChannel): string | null 
         try {
           execSync(`${cc} ${src} -O2 -o ${bin} 2> ${bin}.compile.log`, { stdio: 'ignore' });
         } catch (e:any) {
-          // read compile log if available
           let errText = 'unknown compile error';
           try { errText = fs.readFileSync(bin + '.compile.log', 'utf8'); } catch {}
           if (outputChannel) outputChannel.appendLine(`Time wrapper: compile failed, see ${bin}.compile.log`);
@@ -579,12 +661,92 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
       });
     });
   } else {
-    // Windows PowerShell wrapper approach (keep existing logic but ensure exitSignal:null is returned)
+    // Windows: Try C wrapper first if available (supports MinGW)
+    let wrapperBin: string | null = null;
+    try { wrapperBin = ensureTimeWrapper(outputChannel); } catch {}
+    
+    if (wrapperBin) {
+      const cpuFile = path.join(os.tmpdir(), `npc_cpu_${seedSafeForTracking}_${randomBytes(6).toString("hex")}.txt`);
+      // Note: we pass the raw command line to the C wrapper. 
+      // The C wrapper on Windows uses CreateProcess which handles it.
+      // However, we need to be careful with escaping if we pass via spawn(..., shell: true).
+      // Since shell: true on Windows usually invokes cmd.exe, we must quote arguments.
+      const wrappedCmd = `${wrapperBin} "${runCommand.replace(/"/g, '\\"')}" "${cpuFile.replace(/"/g, '\\"')}"`;
+      
+      if (outputChannel) outputChannel.appendLine(`runCommandCapture (win/c): wrappedCmd=${wrappedCmd}`);
+      
+      return new Promise((resolve) => {
+        const proc = spawn(wrappedCmd, { cwd, shell: true });
+        runningProcesses.set(seedSafeForTracking, (runningProcesses.get(seedSafeForTracking) || []).concat([proc]));
+
+        let collected = Buffer.alloc(0);
+        let stderrAll = "";
+        let timedOut = false;
+        
+        if (proc.stderr) proc.stderr.on("data", d => { stderrAll += d.toString(); });
+        if (proc.stdout) {
+          proc.stdout.on("data", (chunk: Buffer) => {
+            collected = Buffer.concat([collected, chunk]);
+            if (collected.length > maxOutputBytes) { try { killProcGroup(proc); } catch {} }
+          });
+        }
+        if (stdinStream && proc.stdin) {
+            stdinStream.pipe(proc.stdin);
+        } else if (proc.stdin) {
+            try { proc.stdin.end(); } catch {}
+        }
+        
+        const start = Date.now();
+        const timer = setTimeout(() => { try { timedOut = true; killProcGroup(proc); } catch {} }, timeoutMs);
+        
+        proc.on("close", (code, signal) => {
+          clearTimeout(timer);
+          const end = Date.now();
+          const realMs = end - start;
+          const outStr = collected.toString("utf8");
+          
+          let cpuMs = 0;
+          try {
+             if (fs.existsSync(cpuFile)) {
+                 const cpuText = fs.readFileSync(cpuFile, "utf8").trim();
+                 const parts = cpuText.split(/\s+/);
+                 if (parts.length >= 1) {
+                     cpuMs = Math.round(parseFloat(parts[0]) * 1000);
+                 }
+                 try { fs.unlinkSync(cpuFile); } catch {}
+             }
+          } catch {}
+          
+          const arr = runningProcesses.get(seedSafeForTracking) || [];
+          runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
+          
+          const finalSignal = signal ?? (timedOut ? 'TIMEOUT' : null);
+          const finalStderr = timedOut ? (stderrAll + "\n*** Process killed due to timeout ***") : stderrAll;
+          
+          resolve({ 
+              exitCode: timedOut ? null : (code ?? null), 
+              stdout: outStr, 
+              stderr: finalStderr, 
+              cpuTimeMs: cpuMs, 
+              realTimeMs: realMs, 
+              exitSignal: finalSignal 
+          });
+        });
+        
+        proc.on("error", (err) => {
+            clearTimeout(timer);
+            resolve({ exitCode: -1, stdout: "", stderr: String(err), exitSignal: null });
+        });
+      });
+    }
+
+    // Windows PowerShell wrapper approach (Fallback)
+    // Updated to use WaitForExit instead of polling for better short-process accuracy
     const psPath = path.join(os.tmpdir(), `npc_win_wrapper_${seedSafeForTracking}_${randomBytes(6).toString("hex")}.ps1`);
     const psContent = `
 param([string] $cmd)
-# read stdin (if any)
-try { $stdinData = [Console]::In.ReadToEnd() } catch { $stdinData = "" }
+$stdinData = ""
+try { if ([Console]::IsInputRedirected) { $stdinData = [Console]::In.ReadToEnd() } } catch {}
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 function EmitResult($cpu, $real, $out, $err, $exit) {
@@ -592,34 +754,8 @@ function EmitResult($cpu, $real, $out, $err, $exit) {
   $res | ConvertTo-Json -Compress
 }
 
-function SumProcessTreeCpu($rootPid) {
-  $sum = 0
-  try {
-    $all = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId
-    $stack = New-Object System.Collections.ArrayList
-    [void]$stack.Add([int]$rootPid)
-    $visited = @{}
-    $children = @()
-    while ($stack.Count -gt 0) {
-      $cur = $stack[0]
-      $stack.RemoveAt(0)
-      if ($visited.ContainsKey($cur)) { continue }
-      $visited[$cur] = $true
-      $children += $cur
-      $kids = $all | Where-Object { $_.ParentProcessId -eq $cur } | Select-Object -ExpandProperty ProcessId
-      foreach ($k in $kids) { [void]$stack.Add([int]$k) }
-    }
-    foreach ($pid in $children) {
-      try {
-        $gp = Get-Process -Id $pid -ErrorAction SilentlyContinue
-        if ($gp) { $sum += $gp.TotalProcessorTime.TotalMilliseconds }
-      } catch {}
-    }
-  } catch {}
-  return [int][math]::Round($sum)
-}
-
-# naive tokenization to get executable and args
+# Try direct tokenization for Start-Process to avoid overhead if possible,
+# otherwise fallback to cmd.exe
 $m = [regex] '"([^"]*)"|''([^'']*)''|([^\s]+)'
 $parts = @()
 foreach ($mm in $m.Matches($cmd)) {
@@ -633,63 +769,69 @@ try {
     $exe = $parts[0]
     $argList = @()
     if ($parts.Count -gt 1) { $argList = $parts[1..($parts.Count-1)] }
+    
     $outFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "npc_out_$(New-Guid).txt")
     $errFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "npc_err_$(New-Guid).txt")
 
     try {
       $p = Start-Process -FilePath $exe -ArgumentList $argList -RedirectStandardOutput $outFile -RedirectStandardError $errFile -NoNewWindow -PassThru
-      $observed = 0
-      while (-not $p.HasExited) {
-        try { $val = SumProcessTreeCpu($p.Id); if ($val -gt $observed) { $observed = $val } } catch {}
-        Start-Sleep -Milliseconds 50
-      }
-      try { $val = SumProcessTreeCpu($p.Id); if ($val -gt $observed) { $observed = $val } } catch {}
+      
+      # If we have stdin data, we can't easily pipe it to Start-Process unless we used ProcessStartInfo directly.
+      # For now, if stdinData exists, we fall through to the catch block (cmd /c) which handles stdin better via standard .NET pipe.
+      if ($stdinData -ne $null -and $stdinData.Length -gt 0) { throw "Stdin required" }
+
+      $p.WaitForExit()
+      
+      $cpuMs = 0
+      try { $cpuMs = $p.TotalProcessorTime.TotalMilliseconds } catch {}
       $sw.Stop()
       $realMs = [int]$sw.ElapsedMilliseconds
+      
       $out = ""
       $err = ""
       try { $out = Get-Content -Raw -LiteralPath $outFile -ErrorAction SilentlyContinue } catch {}
       try { $err = Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue } catch {}
       try { Remove-Item -LiteralPath $outFile -ErrorAction SilentlyContinue } catch {}
       try { Remove-Item -LiteralPath $errFile -ErrorAction SilentlyContinue } catch {}
-      EmitResult $observed $realMs $out $err $p.ExitCode
+      
+      EmitResult ([int][math]::Round($cpuMs)) $realMs $out $err $p.ExitCode
       exit 0
     } catch {
-      # fallback to cmd.exe invocation when Start-Process redirect not supported or fails
-      $e = $_.Exception.ToString()
-      # attempt cmd.exe /c
-      $psi2 = New-Object System.Diagnostics.ProcessStartInfo
-      $psi2.FileName = "cmd.exe"
-      $psi2.Arguments = "/c " + $cmd
-      $psi2.RedirectStandardOutput = $true
-      $psi2.RedirectStandardError  = $true
-      $psi2.RedirectStandardInput = $true
-      $psi2.UseShellExecute = $false
-      $psi2.CreateNoWindow = $true
+       # Fallback to cmd.exe invocation (handles stdin/piping better)
+       $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+       $psi2.FileName = "cmd.exe"
+       $psi2.Arguments = "/c " + $cmd
+       $psi2.RedirectStandardOutput = $true
+       $psi2.RedirectStandardError  = $true
+       $psi2.RedirectStandardInput = $true
+       $psi2.UseShellExecute = $false
+       $psi2.CreateNoWindow = $true
 
-      $p2 = New-Object System.Diagnostics.Process
-      $p2.StartInfo = $psi2
-      $p2.Start() | Out-Null
-      if ($stdinData -ne $null -and $stdinData.Length -gt 0) { try { $p2.StandardInput.Write($stdinData) } catch {} }
-      try { $p2.StandardInput.Close() } catch {}
-      $out2 = $p2.StandardOutput.ReadToEnd()
-      $err2 = $p2.StandardError.ReadToEnd()
-      $p2.WaitForExit()
-      $sw.Stop()
-      $realMs2 = [int]$sw.ElapsedMilliseconds
-      $observed2 = 0
-      try {
-        while (-not $p2.HasExited) {
-          try { $val2 = SumProcessTreeCpu($p2.Id); if ($val2 -gt $observed2) { $observed2 = $val2 } } catch {}
-          Start-Sleep -Milliseconds 50
-        }
-        try { $val2 = SumProcessTreeCpu($p2.Id); if ($val2 -gt $observed2) { $observed2 = $val2 } } catch {}
-      } catch {}
-      EmitResult $observed2 $realMs2 $out2 $err2 $p2.ExitCode
-      exit 0
+       $p2 = New-Object System.Diagnostics.Process
+       $p2.StartInfo = $psi2
+       $p2.Start() | Out-Null
+       
+       if ($stdinData -ne $null -and $stdinData.Length -gt 0) { 
+         try { $p2.StandardInput.Write($stdinData) } catch {} 
+       }
+       try { $p2.StandardInput.Close() } catch {}
+       
+       $out2 = $p2.StandardOutput.ReadToEnd()
+       $err2 = $p2.StandardError.ReadToEnd()
+       $p2.WaitForExit()
+       
+       # Note: For cmd /c, TotalProcessorTime is just cmd's time, not the child's. 
+       # But without C wrapper, this is the best we can do for shell commands.
+       $cpuMs2 = 0
+       try { $cpuMs2 = $p2.TotalProcessorTime.TotalMilliseconds } catch {}
+       
+       $sw.Stop()
+       $realMs2 = [int]$sw.ElapsedMilliseconds
+       
+       EmitResult ([int][math]::Round($cpuMs2)) $realMs2 $out2 $err2 $p2.ExitCode
+       exit 0
     }
   } else {
-    # nothing to run
     $sw.Stop()
     EmitResult 0 ([int]$sw.ElapsedMilliseconds) "" "" -1
     exit 0
