@@ -138,6 +138,92 @@ function whichSync(cmd: string): string | null {
   }
 }
 
+// C wrapper source used to measure child CPU time with microsecond precision
+const TIME_WRAPPER_C = `#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+int main(int argc, char** argv) {
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <cmd> <outfile>\n", argv[0]);
+    return 2;
+  }
+  const char* cmd = argv[1];
+  const char* outfile = argv[2];
+
+  pid_t pid = fork();
+  if (pid == -1) { perror("fork"); return 2; }
+  if (pid == 0) {
+    execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+    _exit(127);
+  } else {
+    int status = 0;
+    struct rusage ru;
+    if (wait4(pid, &status, 0, &ru) == -1) {
+      perror("wait4");
+      return 2;
+    }
+    double user = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6;
+    double sys = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    FILE* f = fopen(outfile, "w");
+    if (f) {
+      fprintf(f, "%.6f %.6f\n", user, sys);
+      fclose(f);
+    } else {
+      fprintf(stderr, "Failed to open %s for writing\n", outfile);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 0;
+  }
+}
+`;
+
+let cachedTimeWrapperPath: string | null = null;
+function ensureTimeWrapper(outputChannel?: vscode.OutputChannel): string | null {
+  if (cachedTimeWrapperPath) return cachedTimeWrapperPath;
+  const cc = whichSync('gcc') || whichSync('cc');
+  if (!cc) {
+    if (outputChannel) outputChannel.appendLine('Time wrapper: no C compiler found (gcc/cc)');
+    return null;
+  }
+    try {
+    // use a stable path so it's easy to inspect and reuse across runs
+    const bin = path.join(os.tmpdir(), `npc_time_wrapper`);
+    const src = bin + '.c';
+    if (!fs.existsSync(bin)) {
+      if (outputChannel) outputChannel.appendLine(`Time wrapper: writing source to ${src} and compiling with ${cc}`);
+      fs.writeFileSync(src, TIME_WRAPPER_C, 'utf8');
+      try {
+        try {
+          execSync(`${cc} ${src} -O2 -o ${bin} 2> ${bin}.compile.log`, { stdio: 'ignore' });
+        } catch (e:any) {
+          // read compile log if available
+          let errText = 'unknown compile error';
+          try { errText = fs.readFileSync(bin + '.compile.log', 'utf8'); } catch {}
+          if (outputChannel) outputChannel.appendLine(`Time wrapper: compile failed, see ${bin}.compile.log`);
+          try { fs.unlinkSync(src); } catch {}
+          return null;
+        }
+        try { fs.unlinkSync(src); } catch {}
+      } catch (e) {
+        try { fs.unlinkSync(src); } catch {}
+        return null;
+      }
+    }
+    if (fs.existsSync(bin)) {
+      cachedTimeWrapperPath = bin;
+      if (outputChannel) outputChannel.appendLine(`Time wrapper: compiled at ${bin}`);
+      return cachedTimeWrapperPath;
+    }
+  } catch (e:any) {
+    if (outputChannel) outputChannel.appendLine(`Time wrapper: unexpected error: ${String(e)}`);
+  }
+  return null;
+}
+
 async function generateEnvironmentHelperFile(root: string, outputChannel?: vscode.OutputChannel) {
   try {
     const cmds = ['python3','python','py','g++','gcc','/usr/bin/time','time','powershell','pwsh','wmic'];
@@ -398,16 +484,29 @@ async function fileExists(p: string): Promise<boolean> {
 async function runCommandCapture(runCommand: string, cwd: string, stdinStream: fs.ReadStream | null, timeoutMs: number, maxOutputBytes: number, seedSafeForTracking: string, outputChannel?: vscode.OutputChannel): Promise<{ exitCode: number | null; stdout: string; stderr: string; cpuTimeMs?: number; realTimeMs?: number; exitSignal?: string | null }> {
   if (process.platform !== "win32") {
     const timePath = "/usr/bin/time";
-    const useTime = fs.existsSync(timePath);
-    const cpuFile = useTime ? path.join(os.tmpdir(), `npc_cpu_${seedSafeForTracking}_${randomBytes(6).toString("hex")}.txt`) : "";
+    const cpuFile = path.join(os.tmpdir(), `npc_cpu_${seedSafeForTracking}_${randomBytes(6).toString("hex")}.txt`);
     let wrappedCmd = runCommand;
-    if (useTime) {
-      wrappedCmd = `${timePath} -f "%U %S" -o ${JSON.stringify(cpuFile)} sh -c ${JSON.stringify(runCommand)}`;
-    } else {
+    // prefer compiled C wrapper (uses wait4/getrusage -> microsecond precision);
+    // fallback to /usr/bin/time if available, otherwise run plain shell
+    let timingBackend = 'none';
+    try {
+      const wrapperBin = ensureTimeWrapper(outputChannel);
+      if (wrapperBin) {
+        timingBackend = 'c-wrapper';
+        wrappedCmd = `${wrapperBin} ${JSON.stringify(runCommand)} ${JSON.stringify(cpuFile)}`;
+      } else if (fs.existsSync(timePath)) {
+        timingBackend = 'usr-bin-time';
+        wrappedCmd = `${timePath} -f "%U %S" -o ${JSON.stringify(cpuFile)} sh -c ${JSON.stringify(runCommand)}`;
+      } else {
+        timingBackend = 'none';
+        wrappedCmd = `sh -c ${JSON.stringify(runCommand)}`;
+      }
+    } catch (e) {
+      timingBackend = 'none';
       wrappedCmd = `sh -c ${JSON.stringify(runCommand)}`;
     }
 
-    if (outputChannel) outputChannel.appendLine(`runCommandCapture (posix): wrappedCmd=${wrappedCmd} useTime=${useTime}`);
+    if (outputChannel) outputChannel.appendLine(`runCommandCapture (posix): timingBackend=${timingBackend} wrappedCmd=${wrappedCmd} cpuFile=${cpuFile}`);
     return new Promise((resolve) => {
       const proc = spawn(wrappedCmd, { cwd, shell: true, detached: process.platform !== 'win32' });
       runningProcesses.set(seedSafeForTracking, (runningProcesses.get(seedSafeForTracking) || []).concat([proc]));
@@ -437,31 +536,30 @@ async function runCommandCapture(runCommand: string, cwd: string, stdinStream: f
         const end = Date.now();
         const realMs = end - start;
         const outStr = collected.toString("utf8");
-        // prefer cpu time if available
-        if (useTime) {
-          try {
-            const cpuText = fs.existsSync(cpuFile) ? fs.readFileSync(cpuFile, "utf8").trim() : "";
-            if (cpuText) {
-              const parts = cpuText.trim().split(/\s+/);
-              if (parts.length >= 2) {
-                const user = parseFloat(parts[0]) || 0;
-                const sys = parseFloat(parts[1]) || 0;
-                const cpuMs = Math.round((user + sys) * 1000);
-                try { fs.unlinkSync(cpuFile); } catch {}
-                const arr = runningProcesses.get(seedSafeForTracking) || [];
-                runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
-                if (timedOut) {
-                  const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
-                  resolve({ exitCode: null, stdout: outStr, stderr: stderrTimed, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? 'SIGKILL' });
-                } else {
-                  resolve({ exitCode: code === null ? null : code, stdout: outStr, stderr: stderrAll, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? null });
-                }
-                return;
+        // try to read cpu timing file if present (either from C wrapper or /usr/bin/time)
+        try {
+          const cpuText = fs.existsSync(cpuFile) ? fs.readFileSync(cpuFile, "utf8").trim() : "";
+          if (cpuText) {
+            if (outputChannel) outputChannel.appendLine(`CPU timing raw: ${cpuText}`);
+            const parts = cpuText.trim().split(/\s+/);
+            if (parts.length >= 2) {
+              const user = parseFloat(parts[0]) || 0;
+              const sys = parseFloat(parts[1]) || 0;
+              const cpuMs = Math.round((user + sys) * 1000);
+              try { fs.unlinkSync(cpuFile); } catch {}
+              const arr = runningProcesses.get(seedSafeForTracking) || [];
+              runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
+              if (timedOut) {
+                const stderrTimed = stderrAll + "\n*** Process killed due to timeout ***";
+                resolve({ exitCode: null, stdout: outStr, stderr: stderrTimed, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? 'SIGKILL' });
+              } else {
+                resolve({ exitCode: code === null ? null : code, stdout: outStr, stderr: stderrAll, cpuTimeMs: cpuMs, realTimeMs: realMs, exitSignal: signal ?? null });
               }
+              return;
             }
-          } catch (e) {
-            if (outputChannel) { outputChannel.appendLine(`Warning reading cpu file: ${String(e)}`); outputChannel.show(true); }
           }
+        } catch (e) {
+          if (outputChannel) { outputChannel.appendLine(`Warning reading cpu file: ${String(e)}`); outputChannel.show(true); }
         }
         const arr = runningProcesses.get(seedSafeForTracking) || [];
         runningProcesses.set(seedSafeForTracking, arr.filter(p => p !== proc));
@@ -1069,6 +1167,12 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(outputChannel);
   // log environment diagnostics to help debug WSL / platform issues
   try { logEnvironment(outputChannel); } catch {}
+  // try to compile time-wrapper early so logs show build result up front
+  try {
+    try { ensureTimeWrapper(outputChannel); } catch (e:any) { outputChannel.appendLine(`Time wrapper: ensure call failed: ${String(e)}`); }
+  } catch (e:any) {
+    try { outputChannel.appendLine(`Time wrapper: unexpected error during ensure: ${String(e)}`); } catch {}
+  }
 
   const fetchCommand = vscode.commands.registerCommand("npc.fetchGenerator", async () => {
     try {
